@@ -4,11 +4,11 @@ from bs4 import BeautifulSoup
 
 import stats
 
-def scraper(url, resp, stats):
-    links = extract_next_links(url, resp, stats)
+def scraper(url, resp, stats, frontier):
+    links = extract_next_links(url, resp, stats, frontier)
     return [link for link in links if is_valid(link)]
 
-def extract_next_links(url, resp, stats):
+def extract_next_links(url, resp, stats, frontier):
     # Implementation required.
     # url: the URL that was used to get the page
     # resp.url: the actual url of the page
@@ -20,20 +20,50 @@ def extract_next_links(url, resp, stats):
     # Return a list with the hyperlinks (as strings) scrapped from resp.raw_response.content
 
     links = []
-    if (resp.status != 200):
+    #check response status first, if not in good range, do not crawl or process
+    if (resp.status < 200 or resp.status > 299):
         return links
 
+    #check for dead url that return a 200 status but no data
+    if resp.raw_response == None:
+        return links
     
+    #defragment the url and add to set of unique pages
+    home_url = resp.url.split('#', 1)[0]
+    stats.add_unique_page(home_url)
 
+    #parse url and add it to ics subdomain stats if it is in the ics domain
+    parsed = urlparse(home_url)
+    if re.search(r'\.ics\.uci\.edu', parsed.netloc) != None:
+        subdomain_url = f'{parsed.scheme}://{parsed.netloc}'
+        stats.add_ics_subdomain(subdomain_url, home_url)
+
+    #use beautiful soup to parse the HTML
     soup = BeautifulSoup(resp.raw_response.content, 'html.parser')
+    text = soup.get_text()
+
+    #tokenize text and do not crawl if the page is low info
+    tokens = tokenize(text)
+    if detect_low_info(tokens) == True:
+        return links
+
+    #calculate simhash value for page content and check similarity
+    simhash = get_simhash(tokens)
+    if detect_duplicate(simhash, frontier, 0.95) == True:
+        return links
+    else:
+        frontier.add_simhash_index(simhash)
+
+    #if page is good to crawl, get the links and process the text
     for link in soup.find_all('a'):
+        link = link.get('href')
         if (is_valid(link)):
             link_defragment = link.split('#', 1)[0]
-            links.append(link_defragment)
-            #links.append(link)
+            if re.search(r'evoke.ics.uci.edu', link_defragment) == None or re.search(r'replytocom', link_defragment) == None:
+                if len(link_defragment) < 150:
+                    links.append(link_defragment)
 
-    text = soup.get_text()
-    process_text(text, stats)
+    process_text(tokens, home_url, stats)
 
     return links
 
@@ -46,10 +76,11 @@ def is_valid(url) -> bool:
         parsed = urlparse(url)
         if parsed.scheme not in set(["http", "https"]):
             return False
-        if re.search(parsed.netloc, r'ics.uci.edu|cs.uci.edu|informatics.uci.edu|stat.uci.edu|today.uci.edu') == None:
+        #see if url matches the wanted domains using regular expressions
+        if re.search(r'(\.ics\.uci\.edu)|(\.cs\.uci\.edu)|(\.informatics\.uci\.edu)|(\.stat\.uci\.edu)|(today\.uci\.edu)', parsed.netloc) == None:
             return False
-        if re.search(parsed.netloc, r'today.uci.edu') != None:
-            if re.search(parsed.path, r'/department/information_computer_sciences') == None:
+        if re.search(r'today\.uci\.edu', parsed.netloc) != None:
+            if re.search(r'/department/information_computer_sciences', parsed.path) == None:
                 return False
         
         return not re.match(
@@ -63,11 +94,11 @@ def is_valid(url) -> bool:
             + r"|rm|smil|wmv|swf|wma|zip|rar|gz)$", parsed.path.lower())
 
     except TypeError:
-        print ("TypeError for ", parsed)
+        print ("TypeError for ", url)
         raise
 
 
-def tokenize(text: str) -> list(str):
+def tokenize(text: str) -> list:
     tokens = []
     #use regular expressions to slip line by any non English alphanumeric char (special, whitespace, etc)
     words = re.split(r'[^a-zA-Z0-9]+', text.lower().strip(), flags = re.ASCII)
@@ -90,7 +121,8 @@ def tokenize(text: str) -> list(str):
     return tokens
 
 
-def process_text(text: str, stats) -> None:
+def process_text(tokens: list, url: str, stats) -> None:
+    #list of stop words to not count in common words
     stop_words = ['a', 'about', 'above', 'after', 'again', 'against', 'all', 'am', 'an', 'and']
     stop_words += ['any', 'are', "aren't", 'as', 'at', 'be', 'because', 'been', 'before', 'being']
     stop_words += ['below', 'between', 'both', 'but', 'by', "can't", 'cannot', 'could', "couldn't", 'did']
@@ -110,9 +142,84 @@ def process_text(text: str, stats) -> None:
     stop_words += ["why's", 'with', "won't", 'would', "wouldn't", 'you', "you'd", "you'll", "you're", "you've"]
     stop_words += ['your', 'yours', 'yourself', 'yourselves']
 
-    tokens = tokenize(text)
     for token in tokens:
-        if token not in stop_words:
+        #only count a token as a common word if it is not a stop word, is more than one character, and has no numbers
+        if token not in stop_words and len(token) > 1 and re.search(r'\d', token) == None:
             stats.add_common_word(token)
-    
-    stats.change_longest_page(len(tokens))
+    #all tokens go into the longest page stat
+    stats.change_longest_page(url, len(tokens))
+
+def detect_duplicate(simhash: str, frontier, threshold: float) -> bool:
+    s1 = int(simhash, 2)
+    #compare the given simhash to all unique simhashes found before
+    for shash in frontier.get_simhash_index():
+        #calculate similar bits in the fingerprints
+        s2 = int(shash, 2)
+        i = s1 ^ s2
+        diff = 0.0
+        while i:
+            i = i & (i-1)
+            diff += 1.0
+        #using 32 bit fingerprints
+        similar = 32.0 - diff
+        #if the number of similar bits divided by total bits is greater than the given threshold, return true
+        if similar/32.0 >= threshold:
+            return True
+    return False
+
+def detect_low_info(tokens: list) -> bool:
+    words = 0
+    #a page is low info if it has less than 10 words (word-like phrases)
+    for token in tokens:
+        if len(token) > 1 and re.search(r'\d', token) == None:
+            words += 1
+        if words >= 10:
+            return False
+    return True
+
+def compute_word_frequencies(token_list: list) -> dict:
+    token_count = dict()
+    for token in token_list:
+        #if the token is already in the dict, add its count +1
+        if token in token_count:
+            token_count[token] += 1
+        #if not, set the count to 1
+        else:
+            token_count[token] = 1
+    return token_count
+
+def get_simhash(tokens: list) -> str:
+    #defining weights as the frequency of the tokens
+    weights = compute_word_frequencies(tokens)
+    binary = dict()
+    #get the 32 bit binary hash for each token
+    for k in weights.keys():
+        binary[k] = hash32b(k)
+    bit = 31
+    fingerprint = ''
+    #go through each bit of each hashed token and calculate the fingerprint based on weights
+    while bit >= 0:
+        vec = 0
+        for k,v in binary.items():
+            if v[bit] == '0':
+                vec -= weights[k]
+            else:
+                vec += weights[k]
+        if vec > 0:
+            fingerprint = '1' + fingerprint
+        else:
+            fingerprint = '0' + fingerprint
+        bit -= 1
+    return fingerprint
+
+def hash32b(token: str) -> str:
+    #use the default python hash function
+    hashint = hash(token)
+    b = 2**32
+    #mod it so can be represented by 32 bits
+    hashbin = f'{hashint % b:b}'
+    #add extra zeros to the front if neccessary
+    while len(hashbin) < 32:
+        hashbin = '0' + hashbin
+    return hashbin
+

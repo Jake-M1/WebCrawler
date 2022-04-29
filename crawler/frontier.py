@@ -1,5 +1,6 @@
 import os
 import shelve
+import json
 
 from threading import Thread, RLock
 from queue import Queue, Empty
@@ -12,6 +13,13 @@ class Frontier(object):
         self.logger = get_logger("FRONTIER")
         self.config = config
         self.to_be_downloaded = list()
+        #keep a set of all simhash fingerprints to compare similarity
+        self.simhash_index = set()
+        #if continuing the crawl from a previous point, load the simhashes
+        try:
+            self.load_simhash_index()
+        except:
+            pass
         
         if not os.path.exists(self.config.save_file) and not restart:
             # Save file does not exist, but request to load save.
@@ -70,3 +78,24 @@ class Frontier(object):
 
         self.save[urlhash] = (url, True)
         self.save.sync()
+
+
+    def get_simhash_index(self):
+        #return the simhash index set
+        return self.simhash_index
+
+    def add_simhash_index(self, simhash):
+        #add a simhash fingerprint to the simhash index set
+        self.simhash_index.add(simhash)
+
+    def save_simhash_index(self):
+        #use json to dump the simhash index to a local text file as a backup
+        with open('simhash_dump.txt', 'w') as file:
+            json.dump([list(self.simhash_index)], file)
+
+    def load_simhash_index(self):
+        #use json to load the simhash fingerprints from a text file backup
+        with open('simhash_dump.txt', 'r') as file:
+            simhashes = json.load(file)
+        self.simhash_index = set(simhashes[0])
+

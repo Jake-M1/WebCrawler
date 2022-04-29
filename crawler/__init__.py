@@ -10,6 +10,7 @@ class Crawler(object):
         self.frontier = frontier_factory(config, restart)
         self.workers = list()
         self.worker_factory = worker_factory
+        #keep track of stats for report as part of crawler
         self.stats = stats.Stats()
 
     def start_async(self):
